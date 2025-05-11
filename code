@@ -1,1 +1,274 @@
+import random
+import time
+import tracemalloc
+import matplotlib.pyplot as plt
+from itertools import combinations
+from typing import List, Set, Dict, Tuple, Optional
 
+# Tipuri personalizate
+Num = int                              # Literal (variabilă sau negarea ei)
+Clause = Set[Num]                       # Clauză: set de literali
+FormulaCNF = List[Clause]               # Listă de clauze
+Stats = Dict[str, int]                  # Statistici generator și solvers
+TIME_LIMIT = 2.0  # secunde per solver
+
+# Generator de formule CNF aleatoare
+def gen_cnf(max_var: int, n_clauses: int, width: int = 3) -> FormulaCNF:
+    clauses, seen, filtered, trials, max_trials = [], set(), 0, 0, n_clauses * 8
+    while len(clauses) < n_clauses and trials < max_trials:
+        trials += 1
+        new = set()
+        while len(new) < width:
+            v = random.randint(1, max_var)
+            new.add(v if random.choice([True, False]) else -v)
+        if any(-lit in new for lit in new):
+            filtered += 1
+            continue
+        fz = frozenset(new)
+        if fz in seen:
+            filtered += 1
+            continue
+        clauses.append(new)
+        seen.add(fz)
+    print(f"[Generator] create {len(clauses)} clauses, filtered {filtered}")
+    return clauses
+
+# Simplificare după asignare
+def apply_assignment(cnf: FormulaCNF, lit: Num) -> Optional[FormulaCNF]:
+    reduced = []
+    for cl in cnf:
+        if lit in cl:
+            continue
+        pruned = cl - {-lit}
+        if not pruned:
+            return None
+        reduced.append(pruned)
+    return reduced
+
+# Bază solver
+class SolverBase:
+    def solve(self, cnf: FormulaCNF) -> Tuple[bool, Stats]:
+        raise NotImplementedError
+
+# Rezoluție exhaustivă cu time-out
+class ExhaustiveResolver(SolverBase):
+    def solve(self, cnf: FormulaCNF) -> Tuple[bool, Stats]:
+        stats = {'decizii': 0, 'backtrack': 0}
+        clauses = {frozenset(cl) for cl in cnf}
+        start = time.perf_counter()
+        while True:
+            if time.perf_counter() - start > TIME_LIMIT:
+                print("[Timeout] ExhaustiveResolver")
+                return False, stats
+            new_res = set()
+            for c1, c2 in combinations(clauses, 2):
+                for lit in c1:
+                    if time.perf_counter() - start > TIME_LIMIT:
+                        print("[Timeout] ExhaustiveResolver")
+                        return False, stats
+                    if -lit in c2:
+                        stats['decizii'] += 1
+                        resolvent = (c1 | c2) - {lit, -lit}
+                        if not resolvent:
+                            stats['backtrack'] += 1
+                            return False, stats
+                        new_res.add(frozenset(resolvent))
+            if not new_res - clauses:
+                return True, stats
+            clauses |= new_res
+
+# DPLL cu time-out și diverse heuristici
+class DPLLCore(SolverBase):
+    def __init__(self, method: str = 'spl'):
+        self.method = method
+        self.time_limit = TIME_LIMIT
+
+    def unit_propagation(self, cnf: FormulaCNF, assign: Dict[int, bool], stats: Stats) -> Tuple[Optional[FormulaCNF], Dict[int, bool]]:
+        changed = True
+        while changed:
+            changed = False
+            for cl in cnf:
+                if len(cl) == 1:
+                    lit = next(iter(cl)); var = abs(lit)
+                    if var not in assign:
+                        assign[var] = lit > 0; stats['propag'] += 1
+                        cnf = apply_assignment(cnf, lit)
+                        if cnf is None:
+                            stats['backtrack'] += 1; return None, assign
+                        changed = True; break
+        return cnf, assign
+
+    def pure_literal(self, cnf: FormulaCNF, assign: Dict[int, bool], stats: Stats) -> Tuple[Optional[FormulaCNF], Dict[int, bool]]:
+        freq = {}
+        for cl in cnf:
+            for lit in cl: freq[lit] = freq.get(lit, 0) + 1
+        for lit in list(freq):
+            if -lit not in freq:
+                var = abs(lit)
+                if var not in assign:
+                    assign[var] = lit > 0
+                    cnf = apply_assignment(cnf, lit)
+                    if cnf is None:
+                        stats['backtrack'] += 1; return None, assign
+        return cnf, assign
+
+    def choose_var(self, cnf: FormulaCNF, assign: Dict[int, bool], stats: Stats, all_vars: Set[int]) -> Optional[int]:
+        stats['decizii'] += 1
+        unassigned = list(all_vars - set(assign.keys()))
+        if not unassigned:
+            return None
+        if self.method == 'rnd':
+            return random.choice(unassigned)
+        if self.method == 'moms':
+            min_sz = min(len(cl) for cl in cnf if any(abs(l) not in assign for l in cl))
+            cnt = {}
+            for cl in cnf:
+                if len(cl) == min_sz:
+                    for lit in cl:
+                        v = abs(lit)
+                        if v not in assign: cnt[v] = cnt.get(v, 0) + 1
+            return max(cnt, key=cnt.get)
+        if self.method == 'jw':
+            weights = {}
+            for cl in cnf:
+                w = 2 ** -len(cl)
+                for lit in cl:
+                    v = abs(lit)
+                    if v not in assign: weights[v] = weights.get(v, 0) + w
+            return max(weights, key=weights.get)
+        if self.method == 'vsids':
+            return max(unassigned)
+        if self.method == 'bom':
+            score = {v: 0 for v in unassigned}
+            for cl in cnf:
+                for lit in cl:
+                    v = abs(lit)
+                    if v in score: score[v] += 1/len(cl)
+            return max(score, key=score.get)
+        # SPL default: din clauza cea mai scurta
+        shortest = min((cl for cl in cnf if any(abs(l) not in assign for l in cl)), key=len)
+        return abs(next(l for l in shortest if abs(l) not in assign))
+
+    def solve(self, cnf: FormulaCNF) -> Tuple[bool, Stats]:
+        self.stats = {'decizii': 0, 'propag': 0, 'backtrack': 0}
+        all_vars = {abs(l) for cl in cnf for l in cl}
+        self.start_time = time.perf_counter()
+
+        def dfs(c: FormulaCNF, assign: Dict[int, bool]) -> bool:
+            if time.perf_counter() - self.start_time > self.time_limit:
+                print(f"[Timeout] DPLLCore {self.method}")
+                return False
+            c1, a1 = self.unit_propagation(c, assign.copy(), self.stats)
+            if c1 is None: return False
+            if not c1: return True
+            c2, a2 = self.pure_literal(c1, a1, self.stats)
+            if c2 is None: return False
+            if not c2: return True
+            var = self.choose_var(c2, a2, self.stats, all_vars)
+            if var is None: return False
+            for val in (True, False):
+                new_assign = a2.copy(); new_assign[var] = val
+                new_c = apply_assignment(c2, var if val else -var)
+                if new_c and dfs(new_c, new_assign): return True
+            self.stats['backtrack'] += 1
+            return False
+
+        sat = dfs(cnf, {})
+        return sat, self.stats
+
+# Solver Davis–Putnam
+class DavisPutnamSolver(SolverBase):
+    def solve(self, cnf: FormulaCNF) -> Tuple[bool, Stats]:
+        stats = {'decizii': 0, 'backtrack': 0}
+        start = time.perf_counter()
+        vars_all = {abs(l) for cl in cnf for l in cl}
+        order = sorted(vars_all, key=lambda v: -sum(1 for cl in cnf if v in cl or -v in cl))
+        for v in order:
+            if time.perf_counter() - start > TIME_LIMIT:
+                print("[Timeout] DavisPutnamSolver")
+                return False, stats
+            stats['decizii'] += 1
+            pos = [cl for cl in cnf if v in cl]
+            neg = [cl for cl in cnf if -v in cl]
+            others = [cl for cl in cnf if v not in cl and -v not in cl]
+            resolvents = []
+            for p in pos:
+                for n in neg:
+                    if time.perf_counter() - start > TIME_LIMIT:
+                        print("[Timeout] DavisPutnamSolver")
+                        return False, stats
+                    res = (p | n) - {v, -v}
+                    if not res:
+                        stats['backtrack'] += 1
+                        return False, stats
+                    resolvents.append(res)
+            cnf = others + resolvents
+        return True, stats
+
+# Benchmark comparative
+class Benchmark:
+    def __init__(self, var_count: int = 6, clause_sizes: Optional[List[int]] = None):
+        self.var_count = var_count
+        self.clause_sizes = clause_sizes or [6, 8, 10, 12]
+        self.solvers = {
+            'Exhaustive': ExhaustiveResolver(),
+            'Davis-Putnam': DavisPutnamSolver(),
+            'DPLL_SPL': DPLLCore('spl'),
+            'DPLL_RND': DPLLCore('rnd'),
+            'DPLL_MOMS': DPLLCore('moms'),
+            'DPLL_JW': DPLLCore('jw'),
+            'DPLL_VSIDS': DPLLCore('vsids'),
+            'DPLL_BOHM': DPLLCore('bom'),
+        }
+
+    def run(self) -> Dict[str, Dict[str, List]]:
+        data = {name: {'size': [], 'time': [], 'mem': [], 'sat': [], 'dec': [], 'bt': []}
+                for name in self.solvers}
+        for size in self.clause_sizes:
+            print(f"-- testing {size} clauses --")
+            inst = gen_cnf(self.var_count, size)
+            for name, solver in self.solvers.items():
+                if name == 'Exhaustive' and size > 12:
+                    continue
+                copy_inst = [set(cl) for cl in inst]
+                tracemalloc.start()
+                start = time.perf_counter()
+                sat, stats = solver.solve(copy_inst)
+                elapsed = time.perf_counter() - start
+                _, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+                rec = data[name]
+                rec['size'].append(size)
+                rec['time'].append(elapsed)
+                rec['mem'].append(peak / 1024)
+                rec['sat'].append(sat)
+                rec['dec'].append(stats.get('decizii', 0))
+                rec['bt'].append(stats.get('backtrack', 0))
+        return data
+
+    def report(self, results: Dict[str, Dict[str, List]]):
+        headers = ['Solver', 'Clauses', 'SAT', 'Time', 'MemKB', 'Decisions', 'Backtracks']
+        rows = []
+        for solver, stats in results.items():
+            for i, sz in enumerate(stats['size']):
+                rows.append([solver, sz, '✓' if stats['sat'][i] else '✗',
+                             f"{stats['time'][i]:.3f}", f"{stats['mem'][i]:.1f}",
+                             stats['dec'][i], stats['bt'][i]])
+        colw = [max(len(str(cell)) for cell in col) for col in zip(headers, *rows)]
+        fmt = ' | '.join(f"{{:<{w}}}" for w in colw)
+        print(fmt.format(*headers))
+        print('-' * (sum(colw) + 3 * (len(headers) - 1)))
+        for r in rows:
+            print(fmt.format(*r))
+        fig, ax = plt.subplots(figsize=(len(headers), len(rows) * 0.3 + 1))
+        ax.axis('off')
+        tbl = ax.table(cellText=[headers] + rows, loc='center')
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.scale(1, 1.2)
+        plt.show()
+
+if __name__ == '__main__':
+    bench = Benchmark()
+    outcome = bench.run()
+    bench.report(outcome)
