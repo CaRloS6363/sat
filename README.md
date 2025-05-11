@@ -1,1 +1,1 @@
-# sat
+Codul de la progamul sat
